@@ -11,8 +11,11 @@ use linux_perf_data::linux_perf_event_reader::consts::{
     PERF_CONTEXT_GUEST, PERF_CONTEXT_GUEST_KERNEL, PERF_CONTEXT_GUEST_USER, PERF_CONTEXT_KERNEL,
     PERF_CONTEXT_USER,
 };
-use linux_perf_data::linux_perf_event_reader::{self, CpuMode};
-use linux_perf_data::{DsoBuildId, DsoKey, PerfFileReader};
+use linux_perf_data::linux_perf_event_reader::records::{CommonData, ContextSwitchRecord};
+use linux_perf_data::linux_perf_event_reader::{
+    self, AttrFlags, CpuMode, PerfEventType, SamplingPolicy, SoftwareCounterType,
+};
+use linux_perf_data::{AttributeDescription, DsoBuildId, DsoKey, PerfFileReader};
 use linux_perf_event_reader::consts::{
     PERF_CONTEXT_MAX, PERF_REG_ARM64_LR, PERF_REG_ARM64_PC, PERF_REG_ARM64_SP, PERF_REG_ARM64_X29,
     PERF_REG_X86_BP, PERF_REG_X86_IP, PERF_REG_X86_SP,
@@ -114,6 +117,59 @@ impl ConvertRegs for ConvertRegsAarch64 {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EventInterpretation {
+    main_event_attr_index: usize,
+    #[allow(unused)]
+    main_event_name: String,
+    sampling_is_time_based: Option<u64>,
+    have_time_based_cpu_deltas: bool,
+    sched_switch_attr_index: Option<usize>,
+}
+
+impl EventInterpretation {
+    pub fn divine_from_attrs(attrs: &[AttributeDescription]) -> Self {
+        let main_event_attr_index = 0;
+        let main_event_name = attrs[0]
+            .name
+            .as_deref()
+            .unwrap_or("<unnamed event>")
+            .to_string();
+        let sampling_is_time_based = match (attrs[0].attr.type_, attrs[0].attr.sampling_policy) {
+            (_, SamplingPolicy::NoSampling) => {
+                panic!("Can only convert profiles with sampled events")
+            }
+            (_, SamplingPolicy::Frequency(freq)) => {
+                let nanos = 1_000_000_000 / freq;
+                Some(nanos)
+            }
+            (
+                PerfEventType::Software(
+                    SoftwareCounterType::CpuClock | SoftwareCounterType::TaskClock,
+                ),
+                SamplingPolicy::Period(period),
+            ) => {
+                // Assume that we're using a nanosecond clock. TODO: Check how we can know this for sure
+                let nanos = u64::from(period);
+                Some(nanos)
+            }
+            (_, SamplingPolicy::Period(_)) => None,
+        };
+        let have_time_based_cpu_deltas = attrs[0].attr.flags.contains(AttrFlags::CONTEXT_SWITCH);
+        let sched_switch_attr_index = attrs
+            .iter()
+            .position(|attr_desc| attr_desc.name.as_deref() == Some("sched:sched_switch"));
+
+        Self {
+            main_event_attr_index,
+            main_event_name,
+            sampling_is_time_based,
+            have_time_based_cpu_deltas,
+            sched_switch_attr_index,
+        }
+    }
+}
+
 fn convert<U, C, R>(
     mut file: PerfFileReader<R>,
     extra_dir: Option<&Path>,
@@ -133,6 +189,11 @@ where
     let host = file.hostname().unwrap().unwrap_or("<unknown host>");
     let perf_version = file.perf_version().unwrap().unwrap_or("<unknown version>");
     let linux_version = file.os_release().unwrap();
+    let attributes = file.attributes();
+    for event_name in attributes.iter().filter_map(|attr| attr.name.as_deref()) {
+        println!("event {}", event_name);
+    }
+    let interpretation = EventInterpretation::divine_from_attrs(attributes);
 
     let product = "Converted perf profile";
     let mut converter = Converter::<U>::new(
@@ -145,16 +206,39 @@ where
         little_endian,
         cache,
         extra_dir,
+        interpretation.clone(),
     );
 
-    while let Ok(Some((_attr_index, record))) = file.next_record() {
+    let mut last_timestamp = 0;
+
+    while let Ok(Some((attr_index, record))) = file.next_record() {
         let parsed_record = match record.parse() {
             Ok(r) => r,
             Err(_) => continue,
         };
+        if let Some(timestamp) = record.timestamp() {
+            if timestamp < last_timestamp {
+                println!("bad timestamp ordering; {} is earlier but arrived after {}", timestamp, last_timestamp);
+            }
+            last_timestamp = timestamp;
+        }
+        // let common = match record.common_data() {
+        //     Ok(common) => common,
+        //     Err(_) => continue,
+        // };
+        // if common.tid == Some(3105) {
+        //     println!("{:?} for event {}", record.record_type, attr_index);
+        //     println!("{:#?}", parsed_record);
+        //     println!("{:#?}", common);
+        //     println!();
+        // }
         match parsed_record {
             ParsedRecord::Sample(e) => {
-                converter.handle_sample::<C>(e);
+                if attr_index == interpretation.main_event_attr_index {
+                    converter.handle_sample::<C>(e);
+                } else if interpretation.sched_switch_attr_index == Some(attr_index) {
+                    converter.handle_sched_switch::<C>(e);
+                }
             }
             ParsedRecord::Fork(e) => {
                 converter.handle_thread_start(e);
@@ -171,7 +255,16 @@ where
             ParsedRecord::Mmap2(e) => {
                 converter.handle_mmap2(e);
             }
-            _ => {}
+            ParsedRecord::ContextSwitch(e) => {
+                let common = match record.common_data() {
+                    Ok(common) => common,
+                    Err(_) => continue,
+                };
+                converter.handle_context_switch(e, common);
+            }
+            _ => {
+                // println!("{:?}", record.record_type);
+            }
         }
     }
 
@@ -186,8 +279,7 @@ where
     profile: Profile,
     processes: Processes<U>,
     threads: Threads,
-    user_category: CategoryPairHandle,
-    kernel_category: CategoryPairHandle,
+    stack_converter: StackConverter,
     kernel_modules: Vec<LibraryInfo>,
     first_sample_time: u64,
     current_sample_time: u64,
@@ -198,6 +290,8 @@ where
     perf_version: String,
     linux_version: Option<String>,
     extra_binary_artifact_dir: Option<PathBuf>,
+    sampling_is_time_based: Option<u64>,
+    have_time_based_cpu_deltas: bool,
 }
 
 impl<U> Converter<U>
@@ -215,11 +309,16 @@ where
         little_endian: bool,
         cache: U::Cache,
         extra_binary_artifact_dir: Option<&Path>,
+        interpretation: EventInterpretation,
     ) -> Self {
+        let interval = match interpretation.sampling_is_time_based {
+            Some(nanos) => Duration::from_nanos(nanos),
+            None => Duration::from_millis(1),
+        };
         let mut profile = Profile::new(
             product,
             ReferenceTimestamp::from_system_time(SystemTime::now()),
-            Duration::from_millis(1),
+            interval,
         );
         let user_category = profile.add_category("User", CategoryColor::Yellow).into();
         let kernel_category = profile.add_category("Kernel", CategoryColor::Orange).into();
@@ -228,8 +327,10 @@ where
             cache,
             processes: Processes(HashMap::new()),
             threads: Threads(HashMap::new()),
-            user_category,
-            kernel_category,
+            stack_converter: StackConverter {
+                user_category,
+                kernel_category,
+            },
             kernel_modules: Vec::new(),
             first_sample_time,
             current_sample_time: first_sample_time,
@@ -240,6 +341,8 @@ where
             perf_version: perf_version.to_string(),
             linux_version: linux_version.map(ToOwned::to_owned),
             extra_binary_artifact_dir: extra_binary_artifact_dir.map(ToOwned::to_owned),
+            sampling_is_time_based: interpretation.sampling_is_time_based,
+            have_time_based_cpu_deltas: interpretation.have_time_based_cpu_deltas,
         }
     }
 
@@ -254,13 +357,9 @@ where
             .timestamp
             .expect("Can't handle samples without timestamps");
         self.current_sample_time = timestamp;
-        let cpu_delta = if let Some(period) = e.period {
-            // If the observed perf event is one of the clock time events, or cycles, then we should convert it to a CpuDelta.
-            // TODO: Detect event type
-            CpuDelta::from_nanos(period)
-        } else {
-            CpuDelta::from_nanos(0)
-        };
+
+        let profile_timestamp = self.convert_time(timestamp);
+
         let is_main = pid == tid;
         let process = self
             .processes
@@ -272,23 +371,70 @@ where
         let thread =
             self.threads
                 .get_by_tid(tid, process.profile_process, is_main, &mut self.profile);
-        let timestamp = self.convert_time(timestamp);
-        let frames = stack.into_iter().rev().filter_map(|frame| {
-            let (location, mode) = match frame {
-                StackFrame::InstructionPointer(addr, mode) => {
-                    (Frame::InstructionPointer(addr), mode)
+        let thread_handle = thread.profile_thread;
+
+        let cpu_delta = if self.have_time_based_cpu_deltas {
+            let delta = match thread.state {
+                ThreadState::Unknown => 0,
+                ThreadState::Off {
+                    off_switch_timestamp,
+                } => {
+                    let off_duration = timestamp - off_switch_timestamp;
+
+                    // Add an off-cpu sample.
+                    let cpu_delta = CpuDelta::from_nanos(0);
+                    let weight = match self.sampling_is_time_based {
+                        Some(interval_ns) => i32::try_from(off_duration / interval_ns).unwrap_or(0),
+                        None => 0,
+                    };
+                    let frames = self.stack_converter.convert_stack_no_kernel(thread.off_cpu_stack.as_deref().unwrap_or(&[]));
+                    self.profile
+                        .add_sample(thread_handle, profile_timestamp, frames, cpu_delta, weight);
+                    thread.last_sample_timestamp = Some(timestamp);
+
+                    0
                 }
-                StackFrame::ReturnAddress(addr, mode) => (Frame::ReturnAddress(addr), mode),
-                StackFrame::TruncatedStackMarker => return None,
+                ThreadState::On {
+                    last_observed_on_timestamp,
+                } => timestamp - last_observed_on_timestamp,
             };
-            let category = match mode {
-                StackMode::User => self.user_category,
-                StackMode::Kernel => self.kernel_category,
+
+            thread.state = ThreadState::On {
+                last_observed_on_timestamp: timestamp,
             };
-            Some((location, category))
-        });
+            CpuDelta::from_nanos(delta)
+        } else if let Some(period) = e.period {
+            // If the observed perf event is one of the clock time events, or cycles, then we should convert it to a CpuDelta.
+            // TODO: Detect event type
+            CpuDelta::from_nanos(period)
+        } else {
+            CpuDelta::from_nanos(0)
+        };
+
+        let frames = self.stack_converter.convert_stack(stack);
         self.profile
-            .add_sample(thread, timestamp, frames, cpu_delta, 1);
+            .add_sample(thread_handle, profile_timestamp, frames, cpu_delta, 1);
+        thread.last_sample_timestamp = Some(timestamp);
+    }
+
+    pub fn handle_sched_switch<C: ConvertRegs<UnwindRegs = U::UnwindRegs>>(
+        &mut self,
+        e: SampleRecord,
+    ) {
+        let pid = e.pid.expect("Can't handle samples without pids");
+        let tid = e.tid.expect("Can't handle samples without tids");
+        let is_main = pid == tid;
+        let process = self
+            .processes
+            .get_by_pid(pid, &mut self.profile, &self.kernel_modules);
+
+        let mut stack = Vec::new();
+        Self::get_sample_stack::<C>(&e, &process.unwinder, &mut self.cache, &mut stack);
+
+        let thread =
+            self.threads
+                .get_by_tid(tid, process.profile_process, is_main, &mut self.profile);
+        thread.off_cpu_stack = Some(stack);
     }
 
     /// Get the stack contained in this sample, and put it into `stack`.
@@ -444,6 +590,99 @@ where
         }
     }
 
+    pub fn handle_context_switch(&mut self, e: ContextSwitchRecord, common: CommonData) {
+        let pid = common.pid.expect("Can't handle samples without pids");
+        let tid = common.tid.expect("Can't handle samples without tids");
+        let timestamp = common
+            .timestamp
+            .expect("Can't handle context switch without time");
+        let profile_timestamp = self.convert_time(timestamp);
+        let is_main = pid == tid;
+        let process = self
+            .processes
+            .get_by_pid(pid, &mut self.profile, &self.kernel_modules);
+        let process_handle = process.profile_process;
+        let thread = self
+            .threads
+            .get_by_tid(tid, process_handle, is_main, &mut self.profile);
+        let thread_handle = thread.profile_thread;
+        match (&thread.state, e) {
+            (ThreadState::Unknown, ContextSwitchRecord::In { .. }) => {
+                thread.state = ThreadState::On {
+                    last_observed_on_timestamp: timestamp,
+                };
+            }
+            (ThreadState::Unknown, ContextSwitchRecord::Out { .. }) => {
+                thread.state = ThreadState::Off {
+                    off_switch_timestamp: timestamp,
+                };
+            }
+            (
+                ThreadState::Off {
+                    off_switch_timestamp,
+                },
+                ContextSwitchRecord::In { .. },
+            ) => {
+                let off_duration = timestamp - off_switch_timestamp;
+
+                // Add an off-cpu sample.
+                let cpu_delta = CpuDelta::from_nanos(0);
+                let weight = match self.sampling_is_time_based {
+                    Some(interval_ns) => i32::try_from(off_duration / interval_ns).unwrap_or(0),
+                    None => 0,
+                };
+                let frames = self.stack_converter.convert_stack_no_kernel(thread.off_cpu_stack.as_deref().unwrap_or(&[]));
+                self.profile
+                    .add_sample(thread_handle, profile_timestamp, frames, cpu_delta, weight);
+                    thread.last_sample_timestamp = Some(timestamp);
+
+                thread.state = ThreadState::On {
+                    last_observed_on_timestamp: timestamp,
+                };
+            }
+            (
+                ThreadState::On {
+                    last_observed_on_timestamp,
+                },
+                ContextSwitchRecord::Out { .. },
+            ) => {
+                let on_duration = timestamp - last_observed_on_timestamp;
+
+                // Add an off-cpu sample.
+                let cpu_delta = CpuDelta::from_nanos(on_duration);
+                let frames = self.stack_converter.convert_stack_no_kernel(thread.off_cpu_stack.as_deref().unwrap_or(&[]));
+                self.profile
+                    .add_sample(thread_handle, profile_timestamp, frames, cpu_delta, 0);
+                    thread.last_sample_timestamp = Some(timestamp);
+
+                thread.state = ThreadState::Off {
+                    off_switch_timestamp: timestamp,
+                };
+            }
+            (ThreadState::On { .. }, ContextSwitchRecord::In { .. }) => {
+                // We are already in the On state, most likely due to a Sample record which
+                // arrived just before the Switch-In record.
+                // This is quite normal; it happens if we sample as part of the thread
+                // switching operation.
+            }
+            (
+                ThreadState::Off {
+                    off_switch_timestamp,
+                },
+                ContextSwitchRecord::Out { .. },
+            ) => {
+                // We are already in teh Off state but received another Switch-Out record.
+                // This is unexpected; Switch-Out records are the only records that can
+                // get us into the Off state and we do not expect two Switch-Out records
+                // without an in-between Switch-In record.
+                eprintln!(
+                    "Unexpected double-switch-out for tid {}, first at {} and then again at {}",
+                    tid, off_switch_timestamp, timestamp
+                );
+            }
+        }
+    }
+
     pub fn handle_mmap2(&mut self, e: Mmap2Record) {
         const PROT_EXEC: u32 = 0b100;
         if e.protection & PROT_EXEC == 0 {
@@ -493,7 +732,9 @@ where
         let thread = self
             .threads
             .get_by_tid(e.tid, process_handle, is_main, &mut self.profile);
-        self.profile.set_thread_start_time(thread, start_time);
+        let thread_handle = thread.profile_thread;
+        self.profile
+            .set_thread_start_time(thread_handle, start_time);
     }
 
     pub fn handle_thread_end(&mut self, e: ForkOrExitRecord) {
@@ -506,7 +747,8 @@ where
         let thread = self
             .threads
             .get_by_tid(e.tid, process_handle, is_main, &mut self.profile);
-        self.profile.set_thread_end_time(thread, end_time);
+        let thread_handle = thread.profile_thread;
+        self.profile.set_thread_end_time(thread_handle, end_time);
         self.threads.0.remove(&e.tid);
         if is_main {
             self.profile.set_process_end_time(process_handle, end_time);
@@ -526,7 +768,7 @@ where
             };
             let time = self.convert_time(timestamp);
             if let Some(t) = self.threads.0.get(&e.tid) {
-                self.profile.set_thread_end_time(*t, time);
+                self.profile.set_thread_end_time(t.profile_thread, time);
                 self.threads.0.remove(&e.tid);
             }
             if is_main {
@@ -547,8 +789,9 @@ where
         let thread = self
             .threads
             .get_by_tid(e.tid, process_handle, is_main, &mut self.profile);
+        let thread_handle = thread.profile_thread;
 
-        self.profile.set_thread_name(thread, &name);
+        self.profile.set_thread_name(thread_handle, &name);
         if is_main {
             self.profile.set_process_name(process_handle, &name);
         }
@@ -556,7 +799,7 @@ where
         if e.is_execve {
             // Mark this as the start time of the new thread / process.
             let time = self.convert_time(self.current_sample_time);
-            self.profile.set_thread_start_time(thread, time);
+            self.profile.set_thread_start_time(thread_handle, time);
             if is_main {
                 self.profile.set_process_start_time(process_handle, time);
             }
@@ -574,6 +817,56 @@ where
 
     fn convert_time(&self, ktime_ns: u64) -> Timestamp {
         Timestamp::from_nanos_since_reference(ktime_ns.saturating_sub(self.first_sample_time))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StackConverter {
+    user_category: CategoryPairHandle,
+    kernel_category: CategoryPairHandle,
+}
+
+impl StackConverter {
+    fn convert_stack(
+        &self,
+        stack: Vec<StackFrame>,
+    ) -> impl Iterator<Item = (Frame, CategoryPairHandle)> {
+        let user_category = self.user_category;
+        let kernel_category = self.kernel_category;
+        stack.into_iter().rev().filter_map(move |frame| {
+            let (location, mode) = match frame {
+                StackFrame::InstructionPointer(addr, mode) => {
+                    (Frame::InstructionPointer(addr), mode)
+                }
+                StackFrame::ReturnAddress(addr, mode) => (Frame::ReturnAddress(addr), mode),
+                StackFrame::TruncatedStackMarker => return None,
+            };
+            let category = match mode {
+                StackMode::User => user_category,
+                StackMode::Kernel => kernel_category,
+            };
+            Some((location, category))
+        })
+    }
+
+    fn convert_stack_no_kernel<'a>(
+        &self,
+        stack: &'a [StackFrame],
+    ) -> impl Iterator<Item = (Frame, CategoryPairHandle)> + 'a {
+        let user_category = self.user_category;
+        stack.iter().rev().filter_map(move |frame| {
+            let (location, mode) = match *frame {
+                StackFrame::InstructionPointer(addr, mode) => {
+                    (Frame::InstructionPointer(addr), mode)
+                }
+                StackFrame::ReturnAddress(addr, mode) => (Frame::ReturnAddress(addr), mode),
+                StackFrame::TruncatedStackMarker => return None,
+            };
+            match mode {
+                StackMode::User => Some((location, user_category)),
+                StackMode::Kernel => None,
+            }
+        })
     }
 }
 
@@ -609,7 +902,7 @@ where
     }
 }
 
-struct Threads(HashMap<i32, ThreadHandle>);
+struct Threads(HashMap<i32, Thread>);
 
 impl Threads {
     pub fn get_by_tid(
@@ -618,16 +911,35 @@ impl Threads {
         process_handle: ProcessHandle,
         is_main: bool,
         profile: &mut Profile,
-    ) -> ThreadHandle {
-        *self.0.entry(tid).or_insert_with(|| {
-            profile.add_thread(
+    ) -> &mut Thread {
+        self.0.entry(tid).or_insert_with(|| {
+            let profile_thread = profile.add_thread(
                 process_handle,
                 tid as u32,
                 Timestamp::from_millis_since_reference(0.0),
                 is_main,
-            )
+            );
+            Thread {
+                profile_thread,
+                last_sample_timestamp: None,
+                state: ThreadState::Unknown,
+                off_cpu_stack: None,
+            }
         })
     }
+}
+
+struct Thread {
+    profile_thread: ThreadHandle,
+    last_sample_timestamp: Option<u64>,
+    state: ThreadState,
+    off_cpu_stack: Option<Vec<StackFrame>>,
+}
+
+enum ThreadState {
+    Unknown,
+    Off { off_switch_timestamp: u64 },
+    On { last_observed_on_timestamp: u64 },
 }
 
 struct Process<U> {
@@ -757,7 +1069,7 @@ where
 
     let file = open_file_with_fallback(objpath, extra_binary_artifact_dir).ok();
     if file.is_none() && !path.starts_with('[') {
-        eprintln!("Could not open file {:?}", objpath);
+        // eprintln!("Could not open file {:?}", objpath);
     }
 
     let mapping_end_avma = mapping_start_avma + mapping_size;
